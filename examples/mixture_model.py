@@ -7,10 +7,10 @@ from numpyro.distributions import constraints
 from numpyro.distributions.distribution import Distribution
 from numpyro.distributions.continuous import Dirichlet, Normal
 from numpyro.distributions.discrete import Categorical
-from numpyro.util import copy_docs_from
+#from numpyro.util import copy_docs_from
 
 
-@copy_docs_from(Distribution)
+#@copy_docs_from(Distribution)
 class NormalMixture(Distribution):
     arg_constraints = {'weights': constraints.simplex,
                        'locs': constraints.real, 'scales': constraints.positive}
