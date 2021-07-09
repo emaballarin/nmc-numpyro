@@ -49,7 +49,7 @@ def check_dependencies():
         warnings.warn("Missing dependencies: {}.".format(missing_dependencies))
 
 
-DEPENDENCY_PACKAGE_NAMES = ["jaxlib>=0.1.68,<0.1.69", "jax>=0.2.16"]
+DEPENDENCY_PACKAGE_NAMES = ["jaxlib>=0.1.68,<0.1.69", "jax>=0.2.16", "numpyro>=0.6.0"]
 
 check_dependencies()
 
@@ -63,15 +63,23 @@ setup(
     description="Newtonian Monte-Carlo sampling algorithm, implemented in JAX/NumPyro (after Arora et al., 2020)",
     long_description=read("README.md"),
     long_description_content_type="text/markdown",
-    keywords=["Deep Learning", "Machine Learning", "Statistics", "Bayesian Inference", "Sampling", "Markov Chain Monte Carlo"],
+    keywords=[
+        "Deep Learning",
+        "Machine Learning",
+        "Statistics",
+        "Bayesian Inference",
+        "Sampling",
+        "Markov Chain Monte Carlo",
+    ],
     license="Custom",
-    packages=[package for package in find_packages() if package.startswith("nmc-numpyro")],
+    packages=[
+        package for package in find_packages() if package.startswith("nmc-numpyro")
+    ],
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Environment :: Console",
         "Programming Language :: Python :: 3",
-        #"License :: OSI Approved :: Apache Software License",
     ],
     python_requires=">=3.8",
     include_package_data=True,
