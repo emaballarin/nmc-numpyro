@@ -1,180 +1,221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from collections import namedtuple
+from copy import deepcopy
 
-from jax.random import PRNGKey, split
-import jax.numpy as np
-from jax import partial, grad, hessian
+from jax import numpy as jnp
+from jax import vmap, random, device_put, partial, grad, hessian
 
-from numpyro.infer.util import log_density
-import numpyro.distributions as dist
-from numpyro import sample
-from numpyro.handlers import trace, substitute, replay
+from numpyro.infer.mcmc import MCMCKernel
+from numpyro.infer.util import init_to_uniform, log_density
+from numpyro.handlers import seed, substitute, trace
 
+from .utils import initialize_model, ParamInfo, emplace_kv
 from .proposals import minka_distribution_match
-from .utils import filter_unobserved_sites
 
-
-# Tracks state of the NMC algorithm
 NMCState = namedtuple(
-    "NMCState", ["i", "params", "log_likelihood", "accept_prob", "rng_key"]
+    "NMCState",
+    ["i", "z", "mean_accept_prob", "rng_key"],
 )
 
 
-class NMC:
-    # Class containing all of the NMC functionality
-    """
-    The class containing all NMC functionality. This includes the main sampling loop,
-    determination of support, individual proposal distributions and functions for running the algorithm
-    """
-    # Init the classe with a model and the data
+class NMC(MCMCKernel):
+    def __init__(
+        self, model, init_strategy=init_to_uniform, forward_mode_differentiation=False
+    ):
+        self._model = model
+        self._init_strategy = init_strategy
+        self._forward_mode_differentiation = forward_mode_differentiation
 
-    def __init__(self, model, *model_args, rng_key=PRNGKey(0), **model_kwargs):
-        self.model = model
-        self.model_args = model_args
-        self.rng_key = rng_key
-        self.model_kwargs = model_kwargs
+        # Set on first call to init
+        self._distributions_at = None
+        self._sample_single_site_fn = None
+        self._sites_avail_keys = None
+        self._sites_avail_len = None
+        self._sample_fn = None
 
-        tr = trace(model).get_trace(model_args)
-        log_likelihood = log_density(
-            self.model, self.model_args, self.model_kwargs, filter_unobserved_sites(tr)
-        )[0]
+    @property
+    def model(self):
+        return self._model
 
-        self.nmc_state = NMCState(
-            i=0,
-            params=filter_unobserved_sites(tr),
-            log_likelihood=log_likelihood,
-            accept_prob=0.0,
-            rng_key=rng_key,
-        )
+    @property
+    def distributions_at(self):
+        return self._distributions_at
 
-        self.props = {}
-        self.acc_trace = {}
-        self.init_trace()
+    @property
+    def sites_avail_keys(self):
+        return self._sites_avail_keys
 
-    # Initialize the accepted trace proposal objects
+    @property
+    def sites_avail_len(self):
+        return self._sites_avail_len
 
-    def init_trace(self):
-        for name in self.nmc_state.params:
-            dim = len(self.nmc_state.params[name])
-            for i in range(dim):
-                self.props[name + str(i)] = []
-                self.acc_trace[name + str(i)] = []
+    @property
+    def sample_field(self):
+        return "z"
 
-    # The core sampler functions. Running a a single site inferece MH algorithm
+    def get_diagnostics_str(self, state):
+        return "acc. prob={:.2f}".format(state.mean_accept_prob)
 
-    def sample(self):
-        rng_key, rng_key_sample, rng_key_accept = split(self.nmc_state.rng_key, 3)
-        params = self.nmc_state.params
+    def init(
+        self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs=None
+    ):
+        model_kwargs = {} if model_kwargs is None else model_kwargs
 
-        for site in params.keys():
-            # Collect accepted trace
-            for i in range(len(params[site])):
-                self.acc_trace[site + str(i)].append(params[site][i])
-
-            tr_current = trace(substitute(self.model, params)).get_trace(
-                *self.model_args, **self.model_kwargs
-            )
-            ll_current = self.nmc_state.log_likelihood
-
-            val_current = tr_current[site]["value"]
-            dist_curr = tr_current[site]["fn"]
-
-            def log_den_fun(var):
-                return partial(
-                    log_density, self.model, self.model_args, self.model_kwargs
-                )(var)[0]
-
-            val_proposal, dist_proposal = self.proposal(
-                site,
-                log_den_fun,
-                filter_unobserved_sites(tr_current),
-                dist_curr,
-                rng_key_sample,
+        # non-vectorized
+        if rng_key.ndim == 1:
+            rng_key, rng_key_init_model = random.split(rng_key)
+        # vectorized
+        else:
+            rng_key, rng_key_init_model = jnp.swapaxes(
+                vmap(random.split)(rng_key), 0, 1
             )
 
-            tr_proposal = self.retrace(
-                site,
-                tr_current,
-                dist_proposal,
-                val_proposal,
-                self.model_args,
-                self.model_kwargs,
+        #
+        # Surrogate the call to _init_state(self, rng_key, model_args, model_kwargs, init_params)
+        # Part 1: kernel initialization function
+        #
+
+        if init_params is None:
+            init_params, init_trace = initialize_model(
+                rng_key_init_model,
+                self._model,
+                init_strategy=self._init_strategy,
+                model_args=model_args,
+                model_kwargs=model_kwargs,
+                forward_mode_differentiation=self._forward_mode_differentiation,
             )
-            ll_proposal = log_density(
-                self.model,
-                self.model_args,
-                self.model_kwargs,
-                filter_unobserved_sites(tr_proposal),
-            )[0]
-
-            ll_proposal_val = dist_proposal.log_prob(val_current).sum()
-            ll_current_val = dist_curr.log_prob(val_proposal).sum()
-
-            hastings_ratio = (ll_proposal + ll_proposal_val) - (
-                ll_current + ll_current_val
+            self._distributions_at = deepcopy(
+                {k: init_trace[k]["fn"] for k in init_trace.keys()}
             )
+        else:
+            if not isinstance(init_params, ParamInfo):
+                init_params = ParamInfo(init_params)
+                init_trace = trace(
+                    seed(self.model, rng_key if jnp.ndim(rng_key) == 1 else rng_key[0])
+                ).get_trace(*model_args, **model_kwargs)
+                self._distributions_at = deepcopy(
+                    {k: init_trace[k]["fn"] for k in init_trace.keys()}
+                )
 
-            accept_prob = np.minimum(1, np.exp(hastings_ratio))
-            u = sample("u", dist.Uniform(0, 1), rng_key=rng_key_accept)
+        def nmc_init_fn(init_params, rng_key):
+            minus_one_int = jnp.array(-1, dtype=jnp.result_type(int))
+            zero_int = jnp.array(0, dtype=jnp.result_type(int))
+            nmc_state = NMCState(minus_one_int, init_params, zero_int, rng_key)
+            return device_put(nmc_state)
 
-            if u <= accept_prob:
-                params, ll_current = filter_unobserved_sites(tr_proposal), ll_proposal
+        #
+        # Surrogate the call to _init_state(self, rng_key, model_args, model_kwargs, init_params)
+        # Part 2: kernel sampling function
+        #
+
+        def _sample_single_site_fn(
+            nmc_state: NMCState, site_key, model_args=(), model_kwargs=None
+        ):
+            # TODO: cleanup comments!
+
+            # Shorthand partialization
+            def log_density_partialized(params):
+                return partial(log_density, self.model, model_args, model_kwargs)(
+                    params
+                )[0]
+
+            # TODO: Do the split in 3, in the proper way!
+
+            # non-vectorized
+            if nmc_state.rng_key.ndim == 1:
+                rng_key, rng_key_branched = random.split(nmc_state.rng_key)
+                rng_key, rng_key_mh = random.split(rng_key)
+            # vectorized
             else:
-                params, ll_current = filter_unobserved_sites(tr_current), ll_current
+                rng_key, rng_key_branched = jnp.swapaxes(
+                    vmap(random.split)(nmc_state.rng_key), 0, 1
+                )
+                rng_key, rng_key_mh = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
 
-        iter = self.nmc_state.i + 1
-        mean_accept_prob = (
-            self.nmc_state.accept_prob
-            + (accept_prob - self.nmc_state.accept_prob) / iter
-        )
+            # Diag
+            assert site_key in self.sites_avail_keys
+            assert site_key in self.distributions_at.keys()
 
-        return NMCState(iter, params, ll_current, mean_accept_prob, rng_key)
+            # 3) #######
+            #
+            # Compute log density for given state
+            given_state = nmc_state.z.z
+            given_ld = log_density_partialized(given_state)
+            given_site_lp = self.distributions_at[site_key].log_prob()  # FIXME: HM!
+            #
+            # Find suitable proposal
+            grad_to_match = grad(log_density_partialized)(given_state)[site_key]
+            hess_to_match = hessian(log_density_partialized)(given_state)[site_key][
+                site_key
+            ]
+            matched_proposal = minka_distribution_match(self.distributions_at[site_key])
+            #
+            # Sample from proposal
+            site_val_proposal, _ = matched_proposal(
+                rng_key_branched, given_state[site_key], grad_to_match, hess_to_match
+            )
+            #
+            # Create a candidate state
+            proposed_state = emplace_kv(given_state, site_key, site_val_proposal)
+            #
+            # Compute log density for proposed state
+            proposed_ld = log_density_partialized(proposed_state)
+            #
+            #
+            # ##########
+            return None
 
-    # Computes the gradient and hessian to use in the specific proposal function
+        self._sample_single_site_fn = _sample_single_site_fn
 
-    def proposal(self, name, log_den_fun, params, dist_curr, rng_key):
-        grad_fn = grad(log_den_fun)
-        hess_fn = hessian(log_den_fun)
+        def _sample_fn(nmc_state: NMCState, model_args=(), model_kwargs=None):
+            model_kwargs = {} if model_kwargs is None else model_kwargs
 
-        grad_ = grad_fn(params)[name]
-        hess = hess_fn(params)[name][name]
+            # Eventually vectorize
+            rng_key, rng_key_sample, rng_key_accept = random.split(nmc_state.rng_key, 3)
 
-        proposal_ = minka_distribution_match(dist_curr)
-        value, dist_ = proposal_(rng_key, params[name], grad_, hess)
+            # Prepare next state
+            new_i = nmc_state.i + 1
+            new_rng_key = rng_key
 
-        # Collect proposals
-        dim = len(value)
-        for i in range(dim):
-            var_name = name + str(i)
-            self.props[var_name].append(value[i])
+            # TESTS
+            sites_avail = nmc_state.z.z
+            site_sampl = self.sites_avail_keys[new_i % self._sites_avail_len]
 
-        return value, dist_
+            ld = log_density(self.model, model_args, model_kwargs, sites_avail)[0]
+            print(ld)
 
-    # Reruns a trace with the new proposed value and distribution
-    def retrace(self, name, tr, dist_proposal, val_proposal, model_args, model_kwargs):
-        fn_current = tr[name]["fn"]
-        val_current = tr[name]["value"]
+            sites_prop = emplace_kv(
+                sites_avail, site_sampl, jnp.zeros_like(sites_avail.get(site_sampl))
+            )
 
-        tr[name]["fn"] = dist_proposal
-        tr[name]["value"] = val_proposal
+            ld = log_density(self.model, model_args, model_kwargs, sites_prop)[0]
+            print(ld)
 
-        second_trace = trace(replay(self.model, tr)).get_trace(
-            *model_args, **model_kwargs
-        )
+            # TODO: remove ->
+            new_z = nmc_state.z
+            new_mean_acc_prob = nmc_state.mean_accept_prob
+            # TODO: remove <-
 
-        tr[name]["fn"] = fn_current
-        tr[name]["value"] = val_current
+            return NMCState(new_i, new_z, new_mean_acc_prob, new_rng_key)
 
-        return second_trace
+        self._sample_fn = _sample_fn
 
-    # Run the inferece with number of iterations
+        # Vectorization of initialization/sampling
+        # non-vectorized
+        if rng_key.ndim == 1:
+            init_state = nmc_init_fn(init_params, rng_key)
+        # vectorized
+        else:
+            init_state = vmap(nmc_init_fn)(init_params, rng_key)
+            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
+            self._sample_fn = sample_fn
 
-    def run(self, iterations=1000):
-        while self.nmc_state.i < iterations:
-            self.nmc_state = self.sample()
+        # Set model-parameter constants
+        self._sites_avail_keys = tuple(init_state.z.z)
+        self._sites_avail_len = len(self.sites_avail_keys)
+        return init_state
 
-        # Collect last trace
-        for site in self.nmc_state.params.keys():
-            for i in range(len(self.nmc_state.params[site])):
-                self.acc_trace[site + str(i)].append(self.nmc_state.params[site][i])
-
-        return self.nmc_state
+    def sample(self, state, model_args=(), model_kwargs=None):
+        return self._sample_fn(state, model_args, model_kwargs)
