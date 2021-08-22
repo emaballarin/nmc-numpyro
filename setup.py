@@ -49,7 +49,7 @@ def check_dependencies():
         warnings.warn("Missing dependencies: {}.".format(missing_dependencies))
 
 
-DEPENDENCY_PACKAGE_NAMES = ["jaxlib>=0.1.68,<0.1.69", "jax>=0.2.16", "numpyro>=0.6.0"]
+DEPENDENCY_PACKAGE_NAMES = ["jaxlib>=0.1.68", "jax>=0.2.16", "numpyro>=0.6.0"]
 
 check_dependencies()
 
