@@ -22,4 +22,4 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .sampler import NMC
+from .nmc import NMC
