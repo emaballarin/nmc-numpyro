@@ -55,7 +55,7 @@ check_dependencies()
 
 
 setup(
-    name="nmc-numpyro",
+    name="nmc_numpyro",
     version="0.0.1",
     author="<at>Johanpdrsn & Emanuele Ballarin",
     author_email="emanuele@ballarin.cc",
@@ -73,7 +73,7 @@ setup(
     ],
     license="Custom",
     packages=[
-        package for package in find_packages() if package.startswith("nmc-numpyro")
+        package for package in find_packages() if package.startswith("nmc_numpyro")
     ],
     classifiers=[
         "Development Status :: 3 - Alpha",
