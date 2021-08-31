@@ -56,7 +56,7 @@ check_dependencies()
 
 setup(
     name="nmc_numpyro",
-    version="0.0.1",
+    version="0.0.2",
     author="<at>Johanpdrsn & Emanuele Ballarin",
     author_email="emanuele@ballarin.cc",
     url="https://github.com/emaballarin/nmc-numpyro",

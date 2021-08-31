@@ -20,7 +20,10 @@ def minka_normal(
     loc = jnp.subtract(x, jnp.dot(inv_hess, grad))
     sigma = jnp.negative(inv_hess)
 
-    if not ndim == 0 and not jnp.all(jnp.linalg.eigvalsh(sigma) > 0):
+    # If jnp.all(jnp.linalg.eigvalsh(sigma) > 0), this is useless work.
+    # In any case, way faster than disabling JIT compilation!
+    # TODO: Really the best thing to do?
+    if not ndim == 0:
         lamb, vec = jnp.linalg.eigh(sigma)
         sigma = vec @ jnp.diag(jnp.maximum(lamb, normal_sigma_eigen_epsilon)) @ vec.T
 

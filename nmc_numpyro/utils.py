@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from typing import Union
+
 from collections import namedtuple
 from functools import partial
 import warnings
 
-from jax import device_get
+from jax import device_get, random, vmap
 import jax.numpy as jnp
 
 import numpyro
@@ -22,7 +24,7 @@ from numpyro.infer.util import (
     find_valid_initial_params,
 )
 
-__all__ = ["initialize_model", "emplace_kv"]
+__all__ = ["initialize_model", "emplace_kv", "rng_ckd_vec", "kwargsify", "ParamInfo"]
 
 ModelInfo = namedtuple("ModelInfo", ["param_info", "model_trace"])
 ParamInfo = namedtuple("ParamInfo", ["z"])
@@ -35,6 +37,33 @@ def emplace_kv(dictionary: dict, k, v) -> dict:
     return {**dictionary, k: v}
 
 
+def rng_ckd_vec(rng_key, nfolds: int = 1) -> tuple:
+    """
+    Performs n-fold-cascaded dimension-vectorized RNG key derivation for
+    arbitrarily-dimensional RNG seeds (keys).
+    """
+
+    keys = []
+
+    for _ in range(nfolds):
+        # Case: key is 1D
+        if rng_key.ndim == 1:
+            rng_key, to_list = random.split(rng_key)
+        # Case: key is kD, k>1
+        else:
+            rng_key, to_list = jnp.swapaxes(vmap(random.split)(rng_key), 0, 1)
+        keys.append(to_list)
+    keys.insert(0, rng_key)
+    return tuple(keys)
+
+
+def kwargsify(kwargs_or_none: Union[dict, None]) -> dict:
+    """
+    A very common Python idiom as a function!
+    """
+    return {} if kwargs_or_none is None else kwargs_or_none
+
+
 def initialize_model(
     rng_key,
     model,
@@ -44,6 +73,10 @@ def initialize_model(
     model_kwargs=None,
     forward_mode_differentiation=False,
 ):
+    """
+    Port and adaptation of same-named original NumPyro function
+    (cfr.: https://github.com/pyro-ppl/numpyro/blob/master/numpyro/infer/util.py)
+    """
 
     model_kwargs = {} if model_kwargs is None else model_kwargs
     substituted_model = substitute(
